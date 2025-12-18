@@ -24,46 +24,108 @@ class EverandDownloader {
             await this.listen(`https://www.everand.com/listen/podcast/${everandRegex.PODCAST_EPISODE.exec(url)[1]}`)
         } else if (url.match(everandRegex.PODCAST_LISTEN)) {
             await this.listen(url)
+        } else if (url.match(everandRegex.AUDIOBOOK)) {
+            // Grupo 1 es ID para audiolibros (índice ajustado a 1 si la regex no tiene subdominio, pero ahora tiene)
+            // La regex actualizada tiene subdominio en grupo 1 (si no es non-capturing), ID en 2.
+            // Verificamos regex en EverandRegex.js:
+            // const AUDIOBOOK = /^https:\/\/(?:www|es|fr|de|it|pt|ru|ja|ko|zh)\.everand\.com\/audiobook\/([0-9]+)\/([a-zA-z0-9_-]+)/
+            // El grupo del dominio es non-capturing (?:...), así que ID es [1]
+            await this.listen(`https://www.everand.com/listen/audiobook/${everandRegex.AUDIOBOOK.exec(url)[1]}`, true, 'audiobook')
+        } else if (url.match(everandRegex.AUDIOBOOK_LISTEN)) {
+            await this.listen(url, true, 'audiobook')
         } else {
             throw new Error(`Unsupported URL: ${url}`)
         }
     }
 
-    async listen(url, isEpisode) {
+    async listen(url, isEpisode, type = 'podcast') {
         if (typeof isEpisode === "undefined") {
             isEpisode = true
         }
 
-        const episodeId = everandRegex.PODCAST_LISTEN.exec(url)[1]
+        let id
+        if (type === 'audiobook') {
+            id = everandRegex.AUDIOBOOK_LISTEN.exec(url)[1]
+        } else {
+            id = everandRegex.PODCAST_LISTEN.exec(url)[1]
+        }
+
+        console.log(`🎧 Procesando ${type}: ${id}`)
 
         // navigate to everand
         let page = await puppeteerSg.getPage(url)
 
         // wait rendering
-        await new Promise(resolve => setTimeout(resolve, 1000))
+        await new Promise(resolve => setTimeout(resolve, 2000))
 
         // get title, audio-url, series-url
-        const title = await page.evaluate(() => eval('Scribd.current_doc.short_title'))
-        const audioUrl = await page.evaluate(() => document.querySelector('audio#audioplayer').src)
-        const seriesUrl = await page.evaluate(() => document.querySelector('a[href^="https://www.everand.com/podcast-show/"]').href)
+        const title = await page.evaluate(() => {
+            try {
+                return eval('Scribd.current_doc.short_title')
+            } catch {
+                return document.title.split('|')[0].trim()
+            }
+        })
 
-        // prepare output dir
-        let seriesId = everandRegex.PODCAST_SERIES.exec(seriesUrl)[1]
-        let dir = `${output}/${seriesId}`
-        await directoryIo.create(dir)
+        const audioUrl = await page.evaluate(() => {
+            const audio = document.querySelector('audio#audioplayer')
+            return audio ? audio.src : null
+        })
+
+        if (!audioUrl) {
+            console.error('❌ No se encontró la URL del audio. Puede requerir suscripción premium.')
+            await page.close()
+            if (isEpisode) await puppeteerSg.close()
+            return
+        }
+
+        let dir
+        if (type === 'audiobook') {
+            // Para audiolibros, usamos el directorio "audiobooks" y el título del libro
+            dir = `${output}/audiobooks`
+            await directoryIo.create(dir)
+        } else {
+            // Podcast logic
+            let seriesUrl = await page.evaluate(() => {
+                const el = document.querySelector('a[href^="https://www.everand.com/podcast-show/"]')
+                return el ? el.href : null
+            })
+
+            if (seriesUrl) {
+                const seriesId = everandRegex.PODCAST_SERIES.exec(seriesUrl)[1]
+                dir = `${output}/${seriesId}`
+            } else {
+                dir = `${output}/podcasts`
+            }
+            await directoryIo.create(dir)
+        }
 
         // download audio
         const bar = new cliProgress.SingleBar({}, cliProgress.Presets.shades_classic);
         if (isEpisode) {
             bar.start(1, 0)
         }
-        let path = `${dir}/${episodeId}_${title}.mp3`
+
+        // Limpiar nombre de archivo
+        const safeTitle = title.replace(/[^a-z0-9]/gi, '_').toLowerCase()
+        let path = `${dir}/${id}_${safeTitle}.mp3`
+
+        console.log(`⬇️  Descargando a: ${path}`)
+
         const resp = await axios.get(audioUrl, { responseType: 'stream' })
         resp.data.pipe(fs.createWriteStream(path))
-        if (isEpisode) {
-            bar.update(1)
-            bar.stop()
-        }
+
+        // Esperar a que termine la descarga
+        await new Promise((resolve, reject) => {
+            resp.data.on('end', () => {
+                if (isEpisode) {
+                    bar.update(1)
+                    bar.stop()
+                }
+                resolve()
+            })
+            resp.data.on('error', reject)
+        })
 
         await page.close()
         if (isEpisode) {
@@ -79,23 +141,59 @@ class EverandDownloader {
         let page = await puppeteerSg.getPage(url)
 
         // wait rendering
-        await new Promise(resolve => setTimeout(resolve, 1000))
+        await new Promise(resolve => setTimeout(resolve, 2000))
 
-        // get number-of-episodes
-        const totalEpisode = await page.evaluate(() => parseInt(document.querySelector('span[data-e2e="podcast-series-header-total-episodes"]').textContent.replace("episodes", "").trim()))
+        // get number-of-episodes with fallback
+        let totalEpisode = 0
+        try {
+            totalEpisode = await page.evaluate(() => {
+                const el = document.querySelector('span[data-e2e="podcast-series-header-total-episodes"]')
+                return el ? parseInt(el.textContent.replace(/[^0-9]/g, "")) : 0
+            })
+        } catch {
+            console.warn('⚠️  No se pudo determinar el total de episodios')
+        }
 
-        // get pages
-        const totalPage = await page.evaluate(() => [...document.querySelectorAll('div[data-e2e="pagination"] a[aria-label^="Page"]')].at(-1).textContent)
+        // get pages with fallback
+        let totalPage = 1
+        try {
+            const pages = await page.evaluate(() => {
+                const els = document.querySelectorAll('div[data-e2e="pagination"] a[aria-label^="Page"]')
+                return els.length > 0 ? [...els].at(-1).textContent : "1"
+            })
+            totalPage = parseInt(pages)
+        } catch {
+            // Si falla, asumimos 1 página
+        }
+
+        console.log(`📄 Total de páginas detectadas: ${totalPage}`)
+
         const bar = new cliProgress.SingleBar({}, cliProgress.Presets.shades_classic)
-        bar.start(totalEpisode, 0)
-        for (let i = 1; i <= totalPage; i++) {
-            await page.goto(`${url}?page=${i}&sort=desc`, { waitUntil: "load" })
-            await new Promise(resolve => setTimeout(resolve, 1000))
+        bar.start(totalEpisode || 10, 0)
 
-            let episodes = await page.evaluate(() => [...document.querySelectorAll('div.breakpoint_hide.below a[data-e2e="podcast-episode-player-button"]')].map(x => x.href))
+        for (let i = 1; i <= totalPage; i++) {
+            if (i > 1) {
+                await page.goto(`${url}?page=${i}&sort=desc`, { waitUntil: "load" })
+                await new Promise(resolve => setTimeout(resolve, 2000))
+            }
+
+            let episodes = await page.evaluate(() => {
+                // Intentar selector específico primero
+                let links = document.querySelectorAll('div.breakpoint_hide.below a[data-e2e="podcast-episode-player-button"]')
+
+                // Fallback a selectores más genéricos si falla
+                if (links.length === 0) {
+                    links = document.querySelectorAll('a[href^="https://www.everand.com/listen/podcast/"]')
+                }
+
+                return [...links].map(x => x.href)
+            })
+
+            console.log(`⬇️  Procesando página ${i}: ${episodes.length} episodios encontrados`)
+
             for (let j = 0; j < episodes.length; j++) {
                 await this.listen(episodes[j], false)
-                bar.update(((i - 1) * 10) + (j + 1))
+                bar.increment()
             }
         }
         bar.stop()
