@@ -50,11 +50,11 @@ class ScribdDownloader extends BaseDownloader {
         } else {
             this.logger.info('📄 Modo: TEXTO (con fallback automático a imagen si falla)')
             try {
-                // Timeout de 5 minutos para modo texto
+                // Timeout de 10 minutos para modo texto (documentos largos necesitan más tiempo)
                 await Promise.race([
                     this.embedsDefault(embedUrl),
                     new Promise((_, reject) =>
-                        setTimeout(() => reject(new Error('Timeout: Modo texto tardó más de 5 minutos')), 300000)
+                        setTimeout(() => reject(new Error('Timeout: Modo texto tardó más de 10 minutos')), 600000)
                     )
                 ])
             } catch (error) {
@@ -84,6 +84,10 @@ class ScribdDownloader extends BaseDownloader {
             this.logger.info(`🌐 Conectando a Scribd...`)
             page = await this.navigateToPage(url, 1000)
 
+            // Emular medios screen para mejor renderizado de texto
+            await page.emulateMediaType('screen')
+            this.logger.debug('Emulación de medios: screen')
+
             // Obtener el título
             const title = await this.getDocumentTitle(page)
             this.logger.info(`📖 Documento: ${title}`)
@@ -98,6 +102,9 @@ class ScribdDownloader extends BaseDownloader {
             // Cargar todas las páginas mediante scroll
             const pageCount = await this.loadAllPages(page)
             this.logger.info(`📄 Total de páginas: ${pageCount}`)
+
+            // Inyectar CSS para mejorar renderizado de texto
+            await this.injectPrintStyles(page)
 
             // Preparar páginas para captura
             await this.preparePages(page, pageCount)
@@ -174,6 +181,54 @@ class ScribdDownloader extends BaseDownloader {
     }
 
     /**
+     * Inyectar estilos CSS para mejorar renderizado de texto
+     * @param {Page} page - Página de Puppeteer
+     */
+    async injectPrintStyles(page) {
+        this.logger.info('🎨 Inyectando estilos de impresión...')
+
+        await page.addStyleTag({
+            content: `
+                /* Ocultar elementos que ensucian el PDF */
+                .unprintable, .reader_upsell, .buy_button, .mobile_overlay, 
+                .floating_buttons, .promotion, #onesignal-slidedown-container,
+                #onetrust-consent-sdk, .ot-sdk-container, .ot-sdk-row,
+                div[class*="cookie"], div[class*="banner"], div[class*="consent"],
+                footer, .footer, .global_footer { 
+                    display: none !important; 
+                    visibility: hidden !important;
+                    height: 0 !important;
+                    opacity: 0 !important;
+                    pointer-events: none !important;
+                }
+                
+                /* Forzar que el texto sea visible y negro para mejor contraste */
+                .text_layer { 
+                    color: black !important; 
+                    text-shadow: none !important;
+                    opacity: 1 !important;
+                    visibility: visible !important;
+                }
+
+                /* Asegurar que las imágenes de fondo (si las hay) no tapen el texto */
+                .absimg { 
+                    z-index: -1 !important; 
+                }
+
+                /* Quitar márgenes extra para el renderizado por página */
+                div[id^="outer_page_"] { 
+                    margin: 0 !important; 
+                    padding: 0 !important;
+                    page-break-after: always !important; 
+                }
+            `
+        })
+
+        this.logger.debug('✅ Estilos CSS inyectados')
+    }
+
+
+    /**
      * Cargar todas las páginas mediante scroll
      * @param {Page} page - Página de Puppeteer
      * @returns {Promise<number>} Número de páginas
@@ -194,6 +249,17 @@ class ScribdDownloader extends BaseDownloader {
 
         const progress = new ProgressTracker(scrollHeight, 'Cargando páginas')
         progress.start()
+
+        // Verificar que existan capas de texto (opcional, no bloqueante)
+        try {
+            await page.waitForFunction(() => {
+                const textLayers = document.querySelectorAll('.text_layer')
+                return textLayers.length > 0
+            }, { timeout: 5000 })
+            this.logger.info('✅ Capas de texto detectadas')
+        } catch (error) {  // eslint-disable-line
+            this.logger.warn('⚠️  No se detectaron capas de texto, el PDF podría ser solo imagen')
+        }
 
         let scrollTop = await containerSelector.evaluate(el => el.scrollTop)
         let lastScrollTop = -1
