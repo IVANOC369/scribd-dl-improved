@@ -284,7 +284,17 @@ class ScribdDownloader extends BaseDownloader {
             }
             lastScrollTop = scrollTop
 
-            await page.keyboard.press('PageDown')
+            lastScrollTop = scrollTop
+
+            // Scroll nativo agresivo (más confiable que PageDown)
+            await page.evaluate((selector) => {
+                const el = document.querySelector(selector)
+                if (el) {
+                    // Avanzar una pantalla completa + un extra para asegurar carga
+                    el.scrollTop += el.clientHeight
+                }
+            }, 'div.document_scroller')
+
             await new Promise(resolve => setTimeout(resolve, Math.max(50, rendertime)))  // Mínimo 50ms
 
             scrollTop = await containerSelector.evaluate(el => el.scrollTop)
@@ -440,6 +450,15 @@ class ScribdDownloader extends BaseDownloader {
 
         const outputPdfBytes = await outputPdf.save()
         await fs.writeFile(outputPath, outputPdfBytes)
+
+        // Validación de integridad
+        const finalPageCount = outputPdf.getPageCount()
+        if (finalPageCount !== pageCount) {
+            this.logger.warn(`⚠️  PDF generado incompleto: ${finalPageCount}/${pageCount} páginas`)
+            throw new Error(`PDF incompleto: se esperaban ${pageCount} páginas, se obtuvieron ${finalPageCount}`)
+        } else {
+            this.logger.debug(`✅ Integridad verificada: ${finalPageCount}/${pageCount} páginas`)
+        }
     }
 
     /**
