@@ -4,7 +4,10 @@ import pluginJs from "@eslint/js";
 export default [
   {
     languageOptions: {
-      globals: globals.node
+      globals: {
+        ...globals.node,
+        ...globals.browser  // Añadir globals del browser para 'document'
+      }
     }
   },
   pluginJs.configs.recommended,

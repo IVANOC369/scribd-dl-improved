@@ -1,11 +1,8 @@
 import cliProgress from "cli-progress"
 import { puppeteerSg } from "../utils/request/PuppeteerSg.js";
-import { pdfGenerator } from "../utils/io/PdfGenerator.js";
 import { configLoader } from "../utils/io/ConfigLoader.js";
 import { directoryIo } from "../utils/io/DirectoryIo.js"
 import * as everandRegex from "../const/EverandRegex.js"
-import { Image } from "../object/Image.js"
-import sharp from "sharp";
 import axios from "axios";
 import fs from "fs"
 
@@ -22,7 +19,7 @@ class EverandDownloader {
 
     async execute(url) {
         if (url.match(everandRegex.PODCAST_SERIES)) {
-            await this.series(url, )
+            await this.series(url)
         } else if (url.match(everandRegex.PODCAST_EPISODE)) {
             await this.listen(`https://www.everand.com/listen/podcast/${everandRegex.PODCAST_EPISODE.exec(url)[1]}`)
         } else if (url.match(everandRegex.PODCAST_LISTEN)) {
@@ -76,6 +73,7 @@ class EverandDownloader {
 
     async series(url) {
         const seriesId = everandRegex.PODCAST_SERIES.exec(url)[1]
+        console.log(`📻 Descargando serie de podcast: ${seriesId}`)
 
         // navigate to everand
         let page = await puppeteerSg.getPage(url)
@@ -95,7 +93,7 @@ class EverandDownloader {
             await new Promise(resolve => setTimeout(resolve, 1000))
 
             let episodes = await page.evaluate(() => [...document.querySelectorAll('div.breakpoint_hide.below a[data-e2e="podcast-episode-player-button"]')].map(x => x.href))
-            for (let j = 0; j < episodes.length; j++ ) {
+            for (let j = 0; j < episodes.length; j++) {
                 await this.listen(episodes[j], false)
                 bar.update(((i - 1) * 10) + (j + 1))
             }

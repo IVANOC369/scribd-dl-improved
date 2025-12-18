@@ -1,4 +1,4 @@
-import fs from 'fs'
+import { promises as fs } from 'fs'
 
 class DirectoryIo {
     constructor() {
@@ -9,24 +9,30 @@ class DirectoryIo {
     }
 
     /**
-     * Create directories (recursive)
-     * @param {string} dest
-     *        path of a directory
+     * Crear directorios (recursivo)
+     * @param {string} dest - ruta del directorio
      */
     async create(dest) {
-        fs.mkdirSync(dest, { recursive: true }, (err) => {
-            if (err) throw err;
-        })
+        try {
+            await fs.mkdir(dest, { recursive: true })
+        } catch (err) {
+            if (err.code !== 'EEXIST') {
+                throw err
+            }
+            // Si el directorio ya existe, no es un error
+        }
     }
 
     /**
-     * Remove directories (recursive)
-     * @param {string} dest 
+     * Eliminar directorios (recursivo)
+     * @param {string} dest - ruta a eliminar
      */
     async remove(dest) {
-        fs.rmSync(dest, { recursive: true }, (err) => {
-            if (err) throw err;
-        })
+        try {
+            await fs.rm(dest, { recursive: true, force: true })
+        } catch (err) {
+            console.error(`⚠️  Advertencia: No se pudo eliminar ${dest}:`, err.message)
+        }
     }
 }
 
