@@ -89,8 +89,14 @@ class ScribdDownloader extends BaseDownloader {
      * Descarga especializada para Everand Epub Reader (Ingeniería Inversa)
      * @param {string} url 
      */
-    async downloadEverandEpub(url) {
+    async downloadEverandBook(url) {
         this.logger.info(`📖 Conectando al Visor de Everand (Nuevo Motor): ${url}`)
+
+        // 0. Normalización de URL: Si es landing page (/book/), intentar ir directo al lector (/read/)
+        if (url.includes('/book/')) {
+            url = url.replace('/book/', '/read/')
+            this.logger.info(`🔄 URL de landing detectada, redirigiendo al visor: ${url}`)
+        }
 
         // Uso de puppeteerSg para gestionar cookies premium
         const page = await puppeteerSg.getPage(url)
@@ -99,10 +105,31 @@ class ScribdDownloader extends BaseDownloader {
         try {
             await page.setViewport({ width: 1200, height: 1600 })
 
-            // 1. Esperar carga del visor y contador de páginas
+            // 1. Detectar si todavía estamos en una landing page y pulsar "Leer ahora"
+            try {
+                const readButton = await page.evaluateHandle(() => {
+                    const buttons = [...document.querySelectorAll('a, button')];
+                    return buttons.find(b => {
+                        const txt = b.innerText.toLowerCase();
+                        return txt.includes('leer ahora') || txt.includes('read now') || txt.includes('leer gratis');
+                    });
+                });
+
+                if (readButton && await readButton.asElement()) {
+                    this.logger.info('🔘 Botón "Leer ahora" detectado, accediendo al visor...')
+                    await Promise.all([
+                        readButton.click(),
+                        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => { })
+                    ]);
+                }
+            } catch (e) {
+                this.logger.debug('No se encontró botón de lectura, asumiendo carga directa.')
+            }
+
+            // 2. Esperar carga del visor y contador de páginas
             this.logger.info('⏳ Esperando carga del lector...')
-            await page.waitForSelector('.page_counter', { timeout: 45000 }).catch(() => {
-                this.logger.warn('Timeout esperando .page_counter')
+            await page.waitForSelector('.page_counter', { timeout: 30000 }).catch(() => {
+                this.logger.warn('⚠️ No se detectó .page_counter. Es posible que el libro sea solo de imágenes o el visor haya cambiado.')
             })
 
             // 2. Extraer Total de Páginas con lógica robusta
@@ -129,23 +156,55 @@ class ScribdDownloader extends BaseDownloader {
             tempDir = path.join(output, `${title}_temp`)
             await this.createOutputDirectory(tempDir)
 
-            // 3. Inyectar CSS Crítico (Especificación del Usuario)
+            // 3. Inyectar CSS Crítico (LIMPIEZA AGRESIVA)
             await page.addStyleTag({
                 content: `
                     @media print {
-                        .text_line { 
+                        /* 1. Ocultar TODA la interfaz de Everand */
+                        header, footer, nav, 
+                        .global_header, .global_footer,
+                        .top_toolbar, .bottom_toolbar, .toolbar,
+                        .page_control, .prev_btn, .next_btn,
+                        .page_scrubber_container, .scrubber_container,
+                        .osano-cm-dialog, #onetrust-consent-sdk,
+                        .end_of_book_overlay, .confetti_container,
+                        .reader_upsell, .buy_button, .floating_buttons,
+                        /* Barra de progreso inferior tipo "Página X de Y" */
+                        div[class*="progress"], div[class*="footer"],
+                        div[class*="overlay"], div[class*="modal"],
+                        /* Ocultar banners pero PROTEGER el contenedor del lector */
+                        div[class*="banner"]:not(.reader_and_banner_container) { 
+                            display: none !important; 
+                            visibility: hidden !important;
+                            opacity: 0 !important;
+                            height: 0 !important;
+                            pointer-events: none !important;
+                        }
+
+                        /* 2. Forzar que el texto sea visible y negro */
+                        .text_line, .text_line span, p, .word { 
                             color: #000 !important; 
                             opacity: 1 !important; 
                             visibility: visible !important; 
-                            display: block !important; 
+                            -webkit-print-color-adjust: exact !important;
                         }
+
+                        /* 3. Asegurar que el contenedor ocupe todo el PDF */
+                        body, .reader_content, .column_container, .reader_columns, .reader_and_banner_container {
+                            background-color: #fff !important;
+                            color: #000 !important;
+                            margin: 0 !important;
+                            padding: 0 !important;
+                            display: block !important;
+                            visibility: visible !important;
+                            opacity: 1 !important;
+                        }
+
                         .reader_columns { 
                             display: block !important; 
+                            width: 100% !important;
+                            height: 100% !important;
                             overflow: visible !important; 
-                        }
-                        /* Ocultar interfaz */
-                        .osano-cm-dialog, .page_scrubber_container, .top_toolbar, .prev_btn, .next_btn { 
-                            display: none !important; 
                         }
                     }
                 `
@@ -156,12 +215,61 @@ class ScribdDownloader extends BaseDownloader {
             progress.start()
 
             // Click de foco inicial
-            try {
-                await page.click('body')
-            } catch { }
+            try { await page.click('body') } catch { }
 
             for (let i = 1; i <= totalPages; i++) {
-                // Capturar PDF de la página actual
+                // Navegar: La primera vez ya estamos ahí, del i=2 en adelante pulsamos Flecha
+                if (i > 1) {
+                    await page.keyboard.press('ArrowRight');
+                    await new Promise(r => setTimeout(r, 600)); // Delay para animación
+                }
+
+                // VALIDACIÓN DE CONTENIDO Y DETECCIÓN DE FIN
+                let retry = 0;
+                let isLoaded = false;
+                let endDetected = false;
+
+                while (retry < 5 && !isLoaded && !endDetected) {
+                    const status = await page.evaluate(() => {
+                        // 1. ¿Fin del libro detectado?
+                        const endOverlay = document.querySelector('.end_of_book_overlay, .confetti_container');
+                        if (endOverlay && endOverlay.offsetParent !== null) return 'END';
+
+                        // 2. ¿Error de carga detectado?
+                        const bodyTxt = document.body.innerText.toLowerCase();
+                        if (bodyTxt.includes('no se pudo cargar') || bodyTxt.includes('could not load')) return 'ERROR';
+
+                        // 3. ¿Hay contenido real (texto o imagen)?
+                        const lines = document.querySelectorAll('.text_line');
+                        const hasText = Array.from(lines).some(l => l.innerText.trim().length > 1 && l.offsetParent !== null);
+                        const hasImg = !!document.querySelector('.reader_column img[src], .reader_content img[src], img.reader_image');
+
+                        if (hasText || hasImg) return 'OK';
+                        return 'WAIT';
+                    });
+
+                    if (status === 'END') {
+                        this.logger.info(`✨ Fin del libro detectado en página ${i}. Finalizando captura.`);
+                        endDetected = true;
+                        break;
+                    }
+
+                    if (status === 'OK') {
+                        isLoaded = true;
+                    } else {
+                        // Si hay ERROR o WAIT, esperamos y reintentamos
+                        if (status === 'ERROR') {
+                            this.logger.warn(`⚠️ Error de carga en página ${i}, intentando recuperar...`);
+                            await page.evaluate(() => window.scrollBy(0, 10)); // Forzar carga dinámica
+                        }
+                        await new Promise(r => setTimeout(r, 2000));
+                        retry++;
+                    }
+                }
+
+                if (endDetected) break;
+
+                // Capturar PDF
                 const pdfPath = path.join(tempDir, `${String(i).padStart(4, '0')}.pdf`)
                 await page.pdf({
                     path: pdfPath,
@@ -171,31 +279,9 @@ class ScribdDownloader extends BaseDownloader {
                     pageRanges: '1'
                 })
 
-                // Navegar a la siguiente página
-                try {
-                    await page.keyboard.press('ArrowRight')
-                } catch (e) {
-                    this.logger.warn('Error al navegar', e)
-                }
-
-                // IMPORTANTE: Esperar a que el selector .text_line sea visible y estable
-                try {
-                    // Esperamos que haya líneas de texto visibles para confirmar carga
-                    await page.waitForFunction(() => {
-                        const lines = document.querySelectorAll('.text_line');
-                        if (lines.length > 0) {
-                            // Verificar que al menos una línea sea visible (no oculta)
-                            return Array.from(lines).some(l => l.offsetParent !== null);
-                        }
-                        return false;
-                    }, { timeout: 5000 });
-                } catch {
-                    // Si falla (ej. página con solo imagen), esperamos un tiempo fijo por seguridad
-                    await new Promise(r => setTimeout(r, 1500))
-                }
-
                 progress.update(i)
             }
+            progress.complete()
             progress.complete()
 
             // 5. Merge Final
