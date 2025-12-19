@@ -35,8 +35,16 @@ class ScribdDownloader extends BaseDownloader {
         // Convertir URL de documento a URL de embed
         let embedUrl;
         if (url.match(scribdRegex.DOCUMENT)) {
-            // Grupo [3] contiene el document ID (antes era [2], ahora tenemos subdominio en [1])
-            embedUrl = `https://www.scribd.com/embeds/${scribdRegex.DOCUMENT.exec(url)[3]}/content`
+            // Grupo [3] contiene el document ID
+            const m = scribdRegex.DOCUMENT.exec(url)
+            const id = m[3]
+
+            // ESTRATEGIA: Los documentos de Everand ("Books") a menudo existen en Scribd como "Documents".
+            // El visor de lectura de Everand (/read/) es una SPA compleja.
+            // El visor de embeds de Scribd es simple y ya lo soportamos.
+            // Intentaremos forzar el uso del embed de Scribd para este ID.
+
+            embedUrl = `https://www.scribd.com/embeds/${id}/content?start_page=1&view_mode=scroll&access_key=key-1`
         } else if (url.match(scribdRegex.EMBED)) {
             embedUrl = url
         } else {
@@ -141,19 +149,43 @@ class ScribdDownloader extends BaseDownloader {
      * @returns {Promise<string>}
      */
     async getDocumentTitle(page) {
-        const overlay = await this.waitForSelector(
-            page,
-            ["div.mobile_overlay a", "a.bottom_link"],
-            5000
-        )
+        try {
+            // Intentar obtener título del overlay (modo gratuito/preview)
+            const overlay = await this.waitForSelector(
+                page,
+                ["div.mobile_overlay a", "a.bottom_link"],
+                2000 // Reducir timeout ya que es opcional ahora
+            )
 
-        if (!overlay) {
-            throw new Error('No se pudo encontrar el título del documento')
+            if (overlay) {
+                return await overlay.evaluate((el) => {
+                    const href = el.href || ''
+                    return decodeURIComponent(href.split('/').pop().trim())
+                })
+            }
+        } catch {
+            // Ignorar error de timeout
         }
 
-        return await overlay.evaluate((el) => {
-            const href = el.href || ''
-            return decodeURIComponent(href.split('/').pop().trim())
+        // Fallback: Intentar obtener título del documento (modo premium)
+        return await page.evaluate(() => {
+            // Intentar Scribd.current_doc
+            try {
+                if (window.Scribd && window.Scribd.current_doc && window.Scribd.current_doc.title) {
+                    return window.Scribd.current_doc.title;
+                }
+            } catch {
+                // Ignorar error
+            }
+
+            // Intentar meta tag og:title
+            const ogTitle = document.querySelector('meta[property="og:title"]');
+            if (ogTitle && ogTitle.content) {
+                return ogTitle.content;
+            }
+
+            // Fallback final: document.title
+            return document.title.replace(' - Read online', '').replace(' - Scribd', '').replace(' - Everand', '').trim();
         })
     }
 

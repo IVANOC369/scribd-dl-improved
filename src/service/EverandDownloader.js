@@ -33,9 +33,182 @@ class EverandDownloader {
             await this.listen(`https://www.everand.com/listen/audiobook/${everandRegex.AUDIOBOOK.exec(url)[1]}`, true, 'audiobook')
         } else if (url.match(everandRegex.AUDIOBOOK_LISTEN)) {
             await this.listen(url, true, 'audiobook')
+        } else if (url.match(everandRegex.BOOK) || url.match(everandRegex.READ)) {
+            await this.readBook(url)
         } else {
             throw new Error(`Unsupported URL: ${url}`)
         }
+    }
+
+    /**
+     * Descarga de Ebooks de Everand simulando lectura
+     * @param {string} url 
+     */
+    async readBook(url) {
+        console.log(`📖 Iniciando descarga de libro: ${url}`)
+        const page = await puppeteerSg.getPage(url)
+
+        // 1. Detectar y pulsar "Leer ahora" si estamos en la landing page del libro
+        try {
+            // Buscamos botones con texto "Leer ahora" o similar
+            await page.waitForSelector('a[href*="/read/"], button', { timeout: 5000 })
+            const readButton = await page.evaluateHandle(() => {
+                // Buscamos por texto porque las clases cambian
+                const buttons = [...document.querySelectorAll('a, button')];
+                return buttons.find(b => b.innerText.toLowerCase().includes('leer ahora') || b.innerText.toLowerCase().includes('read now'));
+            });
+
+            if (readButton && await readButton.asElement()) {
+                console.log('Botón "Leer ahora" detectado, pulsando...')
+                await Promise.all([
+                    readButton.click(),
+                    page.waitForNavigation({ waitUntil: 'networkidle2' }).catch(() => { })
+                ]);
+            }
+        } catch {
+            console.log('ℹ️  No se detectó botón de landing page, asumiendo vista de lectura directa.')
+        }
+
+        // 2. Esperar al visor de lectura
+        // El visor suele tener indicadores de página tipo "PÁGINA 1 DE 348" o una estructura específica
+        console.log('⏳ Esperando carga del visor...')
+        await new Promise(resolve => setTimeout(resolve, 5000)) // Espera generosa inicial
+
+        // Obtener metadatos básicos
+        let title = "libro_everand";
+        try {
+            title = await page.title();
+            title = title.replace('| Everand', '').trim().replace(/[^a-z0-9]/gi, '_');
+        } catch {
+            // Ignorar error de título
+        }
+
+        const outputDir = `${output}/books/${title}`
+        await directoryIo.create(outputDir)
+        const contentFile = `${outputDir}/content.txt`
+
+        console.log(`⬇️  Guardando contenido en: ${contentFile}`)
+        fs.writeFileSync(contentFile, `TITULO: ${title}\nURL: ${url}\n\n`)
+
+        let hasNext = true
+        let pageNum = 1
+        let noChangeCount = 0
+        let lastContent = ""
+
+        const bar = new cliProgress.SingleBar({}, cliProgress.Presets.shades_classic);
+        bar.start(100, 0); // Desconocemos total exacto al inicio muchas veces
+
+        while (hasNext) {
+            // 3. Extraer contenido
+            // Intentar obtener texto visible del contenedor principal
+            const pageContent = await page.evaluate(() => {
+                // Selectores comunes de lectores de ebooks en web
+                const contentSelectors = [
+                    '.reader_content',
+                    '[role="main"]',
+                    '#main-content',
+                    '.page_content',
+                    'div[class*="text_layer"]',
+                    'div[data-page-number]' // A veces usan data attributes
+                ];
+
+                for (const sel of contentSelectors) {
+                    const el = document.querySelector(sel);
+                    if (el && el.innerText.length > 50) return el.innerText;
+                }
+                return document.body.innerText; // Fallback agresivo
+            });
+
+            // Evitar duplicados exactos si la página no avanzó realmente
+            if (pageContent !== lastContent) {
+                fs.appendFileSync(contentFile, `\n\n--- PÁGINA ${pageNum} ---\n\n${pageContent}`);
+                lastContent = pageContent;
+                noChangeCount = 0;
+                bar.increment();
+                pageNum++;
+                console.log(`📄 Capturada página ${pageNum}`);
+            } else {
+                noChangeCount++;
+                if (noChangeCount > 5) {
+                    console.warn('⚠️  El contenido no cambia. Posible fin del libro o bloqueo.');
+                    break;
+                }
+            }
+
+            // 4. Navegar a siguiente página e interactuar
+            try {
+                let clicked = false;
+
+                // 4.1 Buscar botón "Seguir leyendo" o "Next chapter" dentro del contenido
+                const loadMoreClicked = await page.evaluate(() => {
+                    // Buscamos botones o enlaces visibles que parezcan ser de continuación de lectura
+                    const candidates = [...document.querySelectorAll('button, a, div[role="button"], span')];
+                    const loadMore = candidates.find(b => {
+                        const t = b.innerText.toLowerCase();
+                        // Palabras clave comunes en Everand
+                        return (t.includes('seguir leyendo') ||
+                            t.includes('continue reading') ||
+                            t.includes('siguiente capítulo') ||
+                            t.includes('next chapter'))
+                            && b.offsetParent !== null // Visible
+                            && b.innerText.length < 50; // Evitar falsos positivos con párrafos largos
+                    });
+
+                    if (loadMore) {
+                        loadMore.click();
+                        return true;
+                    }
+                    return false;
+                });
+
+                if (loadMoreClicked) {
+                    console.log('⏬ Botón "Seguir leyendo/Siguiente capítulo" pulsado.');
+                    clicked = true;
+                    // Esperar más tiempo porque esto suele cargar un nuevo capítulo entero
+                    await new Promise(resolve => setTimeout(resolve, 3000));
+                } else {
+                    // 4.2 Buscar botones de "Siguiente" página estándar (flechas, etc.)
+                    clicked = await page.evaluate(() => {
+                        const nextSelectors = [
+                            'button[aria-label*="Next"]',
+                            'button[aria-label*="Siguiente"]',
+                            '.next_page',
+                            '.arrow_right',
+                            'div[class*="next_btn"]',
+                            '[data-e2e="next-chapter-button"]'
+                        ];
+
+                        for (const sel of nextSelectors) {
+                            const btn = document.querySelectorAll(sel);
+                            // A veces hay varios (arriba/abajo), pulsamos el último visible
+                            const visibleBtn = [...btn].find(b => b.offsetParent !== null);
+                            if (visibleBtn) {
+                                visibleBtn.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    });
+                }
+
+                if (!clicked) {
+                    // Intento de clic físico en el borde derecho
+                    const dims = await page.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
+                    await page.mouse.click(dims.w - 50, dims.h / 2);
+                }
+
+                await new Promise(resolve => setTimeout(resolve, 1500)); // Esperar renderizado y transición
+
+            } catch (e) {
+                console.error('Error al navegar:', e);
+                hasNext = false;
+            }
+        }
+
+        bar.stop();
+        console.log('✅  Descarga finalizada (o detenida).');
+        await page.close();
+        await puppeteerSg.close();
     }
 
     async listen(url, isEpisode, type = 'podcast') {
