@@ -33,9 +33,9 @@ class EverandDownloader {
             await this.listen(`https://www.everand.com/listen/audiobook/${everandRegex.AUDIOBOOK.exec(url)[1]}`, true, 'audiobook')
         } else if (url.match(everandRegex.AUDIOBOOK_LISTEN)) {
             await this.listen(url, true, 'audiobook')
-        } else if (url.match(everandRegex.BOOK) || url.match(everandRegex.READ) || url.match(everandRegex.BOOK_READ)) {
-            console.log(`📚 Redirigiendo a ScribdDownloader (Nuevo Motor Epub Reader): ${url}`)
-            await scribdDownloader.execute(url)
+        } else if (url.match(everandRegex.BOOK_READ) || url.match(everandRegex.BOOK_VIEW)) {
+            console.log('📚 Libro detectado. Iniciando motor Epub de Everand...')
+            await scribdDownloader.downloadEverandEpub(url)
         } else {
             throw new Error(`Unsupported URL: ${url}`)
         }

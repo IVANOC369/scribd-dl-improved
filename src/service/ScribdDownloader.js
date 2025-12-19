@@ -85,100 +85,83 @@ class ScribdDownloader extends BaseDownloader {
      * Descarga especializada para Everand Epub Reader
      * @param {string} url 
      */
-    async downloadEverandBook(url) {
-        this.logger.info(`📖 Conectando al Visor de Everand: ${url}`)
+    /**
+     * Descarga especializada para Everand Epub Reader (Ingeniería Inversa)
+     * @param {string} url 
+     */
+    async downloadEverandEpub(url) {
+        this.logger.info(`📖 Conectando al Visor de Everand (Nuevo Motor): ${url}`)
+
+        // Uso de puppeteerSg para gestionar cookies premium
         const page = await puppeteerSg.getPage(url)
         let tempDir = null
 
         try {
             await page.setViewport({ width: 1200, height: 1600 })
 
-            // 1. Manejo inicial (Leer ahora)
-            try {
-                const readBtn = await page.waitForSelector('a[href*="/read/"]', { timeout: 5000 })
-                if (readBtn) {
-                    this.logger.info('Pulsando "Leer ahora"...')
-                    await Promise.all([readBtn.click(), page.waitForNavigation()])
-                }
-            } catch { }
-
-            // 2. Esperar carga del visor
+            // 1. Esperar carga del visor y contador de páginas
             this.logger.info('⏳ Esperando carga del lector...')
-            // Esperamos a que el contador de páginas o las columnas de lectura estén listas
-            await Promise.race([
-                page.waitForSelector('.page_counter', { visible: true }),
-                page.waitForSelector('.reader_columns', { visible: true })
-            ]).catch(() => this.logger.warn('Timeout esperando elementos principales'))
+            await page.waitForSelector('.page_counter', { timeout: 45000 }).catch(() => {
+                this.logger.warn('Timeout esperando .page_counter')
+            })
 
-
-            // 3. Obtener Título y Total Páginas
-            let title = await page.title()
-            title = title.replace('| Everand', '').trim().replace(/[^a-z0-9]/gi, '_')
-
+            // 2. Extraer Total de Páginas con lógica robusta
             let totalPages = 100
             try {
-                const pageCounterText = await page.$eval('.page_counter', el => el.innerText) // Ej: "PÁGINA 1 DE 348"
-                if (pageCounterText.includes('DE')) {
-                    totalPages = parseInt(pageCounterText.split('DE')[1].trim())
+                const pageCounterText = await page.$eval('.page_counter', el => el.innerText) // Ej: "Página 4 de 31" o "Page 4 of 31"
+                this.logger.debug(`Texto contador: ${pageCounterText}`)
+
+                // Lógica de parseo flexible
+                const parts = pageCounterText.split(/\s(de|of)\s/i)
+                if (parts.length > 1) {
+                    totalPages = parseInt(parts.pop().trim())
                 }
             } catch (e) {
-                this.logger.warn('No se pudo leer el total de páginas, usand default', e)
+                this.logger.warn('No se pudo leer el total de páginas, usando default', e)
             }
 
-            this.logger.info(`📘 Libro: ${title} | Total páginas estimadas: ${totalPages}`)
+            // Obtener Título
+            let title = await page.title()
+            title = title.replace('| Everand', '').trim().replace(/[^a-z0-9]/gi, '_')
+            this.logger.info(`📘 Libro: ${title} | Total páginas: ${totalPages}`)
 
-            // Crear directorio temporal
+            // Directorio temporal
             tempDir = path.join(output, `${title}_temp`)
             await this.createOutputDirectory(tempDir)
 
-            // 4. Inyectar CSS de Formato (CORREGIDO PARA VISIBILIDAD DE TEXTO)
+            // 3. Inyectar CSS Crítico (Especificación del Usuario)
             await page.addStyleTag({
                 content: `
-                    .text_line, .text_line span { 
-                        visibility: visible !important; 
-                        opacity: 1 !important; 
-                        color: #000 !important; 
-                        display: block !important;
+                    @media print {
+                        .text_line { 
+                            color: #000 !important; 
+                            opacity: 1 !important; 
+                            visibility: visible !important; 
+                            display: block !important; 
+                        }
+                        .reader_columns { 
+                            display: block !important; 
+                            overflow: visible !important; 
+                        }
+                        /* Ocultar interfaz */
+                        .osano-cm-dialog, .page_scrubber_container, .top_toolbar, .prev_btn, .next_btn { 
+                            display: none !important; 
+                        }
                     }
-                    .bold, strong, b { font-weight: bold !important; }
-                    .reader_columns { background: white !important; }
-                    /* Ocultar elementos de interfaz */
-                    .page_scrubber_container, .osano-cm-dialog, .top_toolbar, 
-                    .scrubber, .toolbar, header, footer, .header, .footer { 
-                        display: none !important; 
-                    }
-                    .reader_column, .reader_content {
-                        opacity: 1 !important; 
-                        visibility: visible !important;
-                    }
-                    body { background-color: white !important; }
                 `
             });
 
-            // 5. Bucle de Captura
+            // 4. Bucle de Captura
             const progress = new ProgressTracker(totalPages, 'Capturando páginas')
             progress.start()
 
-            // CRÍTICO: Hacer clic en el centro para enfocar el visor antes de usar el teclado
+            // Click de foco inicial
             try {
-                const viewPort = page.viewport()
-                await page.mouse.click(viewPort.width / 2, viewPort.height / 2)
-            } catch (e) {
-                this.logger.warn('No se pudo hacer clic para enfocar, intentando continuar...')
-            }
+                await page.click('body')
+            } catch { }
 
             for (let i = 1; i <= totalPages; i++) {
-                // Esperar a que el selector DE TEXTO sea visible
-                try {
-                    await page.waitForSelector('.text_line', { visible: true, timeout: 5000 })
-                } catch {
-                    this.logger.debug(`⚠️ Timeout esperando .text_line en pág ${i} (puede ser imagen o página vacía)`)
-                }
-
-                // Pequeña espera para renderizado de fuentes
-                await new Promise(r => setTimeout(r, 1000))
-
-                // Capturar PDF de la vista actual
+                // Capturar PDF de la página actual
                 const pdfPath = path.join(tempDir, `${String(i).padStart(4, '0')}.pdf`)
                 await page.pdf({
                     path: pdfPath,
@@ -188,17 +171,34 @@ class ScribdDownloader extends BaseDownloader {
                     pageRanges: '1'
                 })
 
-                // Navegar siguiente página con Teclado (Flecha Derecha)
-                await page.keyboard.press('ArrowRight')
+                // Navegar a la siguiente página
+                try {
+                    await page.keyboard.press('ArrowRight')
+                } catch (e) {
+                    this.logger.warn('Error al navegar', e)
+                }
 
-                // Pausa para transición
-                await new Promise(r => setTimeout(r, 500))
+                // IMPORTANTE: Esperar a que el selector .text_line sea visible y estable
+                try {
+                    // Esperamos que haya líneas de texto visibles para confirmar carga
+                    await page.waitForFunction(() => {
+                        const lines = document.querySelectorAll('.text_line');
+                        if (lines.length > 0) {
+                            // Verificar que al menos una línea sea visible (no oculta)
+                            return Array.from(lines).some(l => l.offsetParent !== null);
+                        }
+                        return false;
+                    }, { timeout: 5000 });
+                } catch {
+                    // Si falla (ej. página con solo imagen), esperamos un tiempo fijo por seguridad
+                    await new Promise(r => setTimeout(r, 1500))
+                }
 
                 progress.update(i)
             }
             progress.complete()
 
-            // 6. Merge final
+            // 5. Merge Final
             const outputPdfPath = path.join(output, `${title}.pdf`)
             await this.mergePdfs(tempDir, totalPages, outputPdfPath)
 
@@ -207,13 +207,13 @@ class ScribdDownloader extends BaseDownloader {
 
         } catch (e) {
             this.logger.error('Error en descarga de Everand Book', e)
-            // if (tempDir) await directoryIo.remove(tempDir) // Dejar temp para debug si falla
             throw e
         } finally {
             if (page) await page.close()
             await puppeteerSg.close()
         }
     }
+
 
     /**
      * Descargar usando modo texto/PDF (predeterminado)

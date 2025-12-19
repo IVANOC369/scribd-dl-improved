@@ -7,6 +7,7 @@ const AUDIOBOOK = /^https:\/\/(?:www|es|fr|de|it|pt|ru|ja|ko|zh)\.everand\.com\/
 const AUDIOBOOK_LISTEN = /^https:\/\/(?:www|es|fr|de|it|pt|ru|ja|ko|zh)\.everand\.com\/listen\/audiobook\/([0-9]+)/
 export const BOOK = /^https:\/\/(?:www|es|fr|de|it|pt|ru|ja|ko|zh)\.everand\.com\/book\/([0-9]+)\/([a-zA-z0-9_-]+)/
 export const READ = /^https:\/\/(?:www|es|fr|de|it|pt|ru|ja|ko|zh)\.everand\.com\/read\/([0-9]+)\/([a-zA-z0-9_-]+)/
-export const BOOK_READ = /^https:\/\/www\.everand\.com\/read\/([0-9]+)/
+export const BOOK_READ = /^https:\/\/(?:www|es|fr|de|it|pt|ru|ja|ko|zh)\.everand\.com\/read\/([0-9]+)/
+export const BOOK_VIEW = /^https:\/\/(?:www|es|fr|de|it|pt|ru|ja|ko|zh)\.everand\.com\/book\/([0-9]+)/
 
 export { DOMAIN, PODCAST_SERIES, PODCAST_EPISODE, PODCAST_LISTEN, AUDIOBOOK, AUDIOBOOK_LISTEN }
