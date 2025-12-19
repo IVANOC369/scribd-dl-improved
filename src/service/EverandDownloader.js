@@ -5,7 +5,12 @@ import { directoryIo } from "../utils/io/DirectoryIo.js"
 import * as everandRegex from "../const/EverandRegex.js"
 import axios from "axios";
 import fs from "fs"
+import { pdfGenerator } from "../utils/io/PdfGenerator.js"
+import { Image } from "../object/Image.js"
+import sharp from "sharp"
+import path from "path"
 
+import { scribdDownloader } from "./ScribdDownloader.js"
 
 const output = configLoader.load("DIRECTORY", "output")
 
@@ -25,35 +30,33 @@ class EverandDownloader {
         } else if (url.match(everandRegex.PODCAST_LISTEN)) {
             await this.listen(url)
         } else if (url.match(everandRegex.AUDIOBOOK)) {
-            // Grupo 1 es ID para audiolibros (índice ajustado a 1 si la regex no tiene subdominio, pero ahora tiene)
-            // La regex actualizada tiene subdominio en grupo 1 (si no es non-capturing), ID en 2.
-            // Verificamos regex en EverandRegex.js:
-            // const AUDIOBOOK = /^https:\/\/(?:www|es|fr|de|it|pt|ru|ja|ko|zh)\.everand\.com\/audiobook\/([0-9]+)\/([a-zA-z0-9_-]+)/
-            // El grupo del dominio es non-capturing (?:...), así que ID es [1]
             await this.listen(`https://www.everand.com/listen/audiobook/${everandRegex.AUDIOBOOK.exec(url)[1]}`, true, 'audiobook')
         } else if (url.match(everandRegex.AUDIOBOOK_LISTEN)) {
             await this.listen(url, true, 'audiobook')
-        } else if (url.match(everandRegex.BOOK) || url.match(everandRegex.READ)) {
-            await this.readBook(url)
+        } else if (url.match(everandRegex.BOOK) || url.match(everandRegex.READ) || url.match(everandRegex.BOOK_READ)) {
+            console.log(`📚 Redirigiendo a ScribdDownloader (Nuevo Motor Epub Reader): ${url}`)
+            await scribdDownloader.execute(url)
         } else {
             throw new Error(`Unsupported URL: ${url}`)
         }
     }
 
     /**
-     * Descarga de Ebooks de Everand simulando lectura
+     * Descarga de Ebooks de Everand mediante captura visual a PDF
      * @param {string} url 
      */
     async readBook(url) {
-        console.log(`📖 Iniciando descarga de libro: ${url}`)
+        console.log(`📖 Iniciando descarga de libro (Modo Visual PDF Perfecto): ${url}`)
         const page = await puppeteerSg.getPage(url)
 
-        // 1. Detectar y pulsar "Leer ahora" si estamos en la landing page del libro
+        // Configurar viewport vertical (tipo Tableta) para forzar vista de UNA sola página
+        // Esto evita el problema de doble columna que causa pérdida de páginas
+        await page.setViewport({ width: 800, height: 1200, deviceScaleFactor: 2 })
+
+        // 1. Detectar y pulsar "Leer ahora"
         try {
-            // Buscamos botones con texto "Leer ahora" o similar
             await page.waitForSelector('a[href*="/read/"], button', { timeout: 5000 })
             const readButton = await page.evaluateHandle(() => {
-                // Buscamos por texto porque las clases cambian
                 const buttons = [...document.querySelectorAll('a, button')];
                 return buttons.find(b => b.innerText.toLowerCase().includes('leer ahora') || b.innerText.toLowerCase().includes('read now'));
             });
@@ -69,138 +72,104 @@ class EverandDownloader {
             console.log('ℹ️  No se detectó botón de landing page, asumiendo vista de lectura directa.')
         }
 
-        // 2. Esperar al visor de lectura
-        // El visor suele tener indicadores de página tipo "PÁGINA 1 DE 348" o una estructura específica
         console.log('⏳ Esperando carga del visor...')
-        await new Promise(resolve => setTimeout(resolve, 5000)) // Espera generosa inicial
+        await new Promise(resolve => setTimeout(resolve, 5000))
 
-        // Obtener metadatos básicos
-        let title = "libro_everand";
+        // Obtener título
+        let title = "libro_everand"
         try {
-            title = await page.title();
-            title = title.replace('| Everand', '').trim().replace(/[^a-z0-9]/gi, '_');
-        } catch {
-            // Ignorar error de título
-        }
+            title = await page.title()
+            title = title.replace('| Everand', '').trim().replace(/[^a-z0-9]/gi, '_')
+        } catch { }
 
-        const outputDir = `${output}/books/${title}`
+        const outputDir = `${output}/books/${title}_pdf`
         await directoryIo.create(outputDir)
-        const contentFile = `${outputDir}/content.txt`
+        const tempImgDir = path.join(outputDir, 'temp_images')
+        await directoryIo.create(tempImgDir)
 
-        console.log(`⬇️  Guardando contenido en: ${contentFile}`)
-        fs.writeFileSync(contentFile, `TITULO: ${title}\nURL: ${url}\n\n`)
+        console.log(`⬇️  Capturando páginas en: ${tempImgDir}`)
+
+        // Inyectar CSS para limpiar interfaz y forzar tema claro para impresión
+        await page.addStyleTag({
+            content: `
+                /* Ocultar UI de Everand para captura limpia */
+                header, footer, nav,
+                .header, .footer, .global_header,
+                .scrubber, /* Barra de progreso inferior */
+                .toolbar, /* Barras de herramientas */
+                button[aria-label="Previous page"], 
+                button[aria-label="Next page"],
+                .arrow_left, .arrow_right,
+                div[class*="page_controls"],
+                div[class*="progress"] { 
+                    opacity: 0 !important; 
+                    visibility: hidden !important; 
+                    pointer-events: none !important; /* Para que no bloqueen clics */
+                }
+                
+                /* Forzar fondo blanco y texto negro para PDF legible */
+                body, .reader_content, [role="main"] {
+                    background-color: white !important;
+                    color: black !important;
+                }
+                
+                /* Asegurar que el contenido ocupe toda la pantalla */
+                .reader_content {
+                    height: 100vh !important;
+                    width: 100vw !important;
+                    margin: 0 !important;
+                    padding: 20px !important; /* Margen de seguridad */
+                }
+            `
+        })
 
         let hasNext = true
         let pageNum = 1
+        const images = []
         let noChangeCount = 0
-        let lastContent = ""
+        let lastBuffer = null
 
-        const bar = new cliProgress.SingleBar({}, cliProgress.Presets.shades_classic);
-        bar.start(100, 0); // Desconocemos total exacto al inicio muchas veces
+        const bar = new cliProgress.SingleBar({}, cliProgress.Presets.shades_classic)
+        bar.start(300, 0) // Estimado
 
         while (hasNext) {
-            // 3. Extraer contenido
-            // Intentar obtener texto visible del contenedor principal
-            const pageContent = await page.evaluate(() => {
-                // Selectores comunes de lectores de ebooks en web
-                const contentSelectors = [
-                    '.reader_content',
-                    '[role="main"]',
-                    '#main-content',
-                    '.page_content',
-                    'div[class*="text_layer"]',
-                    'div[data-page-number]' // A veces usan data attributes
-                ];
+            // Esperar renderizado completo (importante para las fuentes)
+            await new Promise(resolve => setTimeout(resolve, 2000))
 
-                for (const sel of contentSelectors) {
-                    const el = document.querySelector(sel);
-                    if (el && el.innerText.length > 50) return el.innerText;
+            // Capturar screenshot del viewport completo (ya que limpiamos la UI)
+            const imgPath = path.join(tempImgDir, `${String(pageNum).padStart(4, '0')}.png`)
+
+            const buffer = await page.screenshot({
+                path: imgPath,
+                fullPage: false // Capturar solo lo que se ve (una página)
+            })
+
+            // Detección de fin por imagen duplicada (si no avanza)
+            if (lastBuffer && buffer.equals(lastBuffer)) {
+                noChangeCount++
+                if (noChangeCount > 3) {
+                    console.warn('⚠️  La página no cambia, fin del libro detectado.')
+                    break
                 }
-                return document.body.innerText; // Fallback agresivo
-            });
-
-            // Evitar duplicados exactos si la página no avanzó realmente
-            if (pageContent !== lastContent) {
-                fs.appendFileSync(contentFile, `\n\n--- PÁGINA ${pageNum} ---\n\n${pageContent}`);
-                lastContent = pageContent;
-                noChangeCount = 0;
-                bar.increment();
-                pageNum++;
-                console.log(`📄 Capturada página ${pageNum}`);
             } else {
-                noChangeCount++;
-                if (noChangeCount > 5) {
-                    console.warn('⚠️  El contenido no cambia. Posible fin del libro o bloqueo.');
-                    break;
-                }
+                noChangeCount = 0
+                lastBuffer = buffer
+
+                const metadata = await sharp(buffer).metadata()
+                images.push(new Image(imgPath, metadata.width, metadata.height))
+
+                bar.increment()
+                pageNum++
             }
 
-            // 4. Navegar a siguiente página e interactuar
+            // Navegar siguiente
             try {
-                let clicked = false;
-
-                // 4.1 Buscar botón "Seguir leyendo" o "Next chapter" dentro del contenido
-                const loadMoreClicked = await page.evaluate(() => {
-                    // Buscamos botones o enlaces visibles que parezcan ser de continuación de lectura
-                    const candidates = [...document.querySelectorAll('button, a, div[role="button"], span')];
-                    const loadMore = candidates.find(b => {
-                        const t = b.innerText.toLowerCase();
-                        // Palabras clave comunes en Everand
-                        return (t.includes('seguir leyendo') ||
-                            t.includes('continue reading') ||
-                            t.includes('siguiente capítulo') ||
-                            t.includes('next chapter'))
-                            && b.offsetParent !== null // Visible
-                            && b.innerText.length < 50; // Evitar falsos positivos con párrafos largos
-                    });
-
-                    if (loadMore) {
-                        loadMore.click();
-                        return true;
-                    }
-                    return false;
-                });
-
-                if (loadMoreClicked) {
-                    console.log('⏬ Botón "Seguir leyendo/Siguiente capítulo" pulsado.');
-                    clicked = true;
-                    // Esperar más tiempo porque esto suele cargar un nuevo capítulo entero
-                    await new Promise(resolve => setTimeout(resolve, 3000));
-                } else {
-                    // 4.2 Buscar botones de "Siguiente" página estándar (flechas, etc.)
-                    clicked = await page.evaluate(() => {
-                        const nextSelectors = [
-                            'button[aria-label*="Next"]',
-                            'button[aria-label*="Siguiente"]',
-                            '.next_page',
-                            '.arrow_right',
-                            'div[class*="next_btn"]',
-                            '[data-e2e="next-chapter-button"]'
-                        ];
-
-                        for (const sel of nextSelectors) {
-                            const btn = document.querySelectorAll(sel);
-                            // A veces hay varios (arriba/abajo), pulsamos el último visible
-                            const visibleBtn = [...btn].find(b => b.offsetParent !== null);
-                            if (visibleBtn) {
-                                visibleBtn.click();
-                                return true;
-                            }
-                        }
-                        return false;
-                    });
-                }
-
-                if (!clicked) {
-                    // Intento de clic físico en el borde derecho
-                    const dims = await page.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
-                    await page.mouse.click(dims.w - 50, dims.h / 2);
-                }
-
-                await new Promise(resolve => setTimeout(resolve, 1500)); // Esperar renderizado y transición
+                // Hacemos CLIC en el borde derecho (95% ancho, 50% alto)
+                // Esta es la forma más universal de avanzar en lectores e-book táctiles/web
+                const dims = await page.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }))
+                await page.mouse.click(dims.w * 0.95, dims.h * 0.5)
 
             } catch (e) {
-                console.error('Error al navegar:', e);
                 hasNext = false;
             }
         }

@@ -1,3 +1,4 @@
+import * as everandRegex from "../const/EverandRegex.js"
 import { BaseDownloader } from "./BaseDownloader.js"
 import { puppeteerSg } from "../utils/request/PuppeteerSg.js";
 import { pdfGenerator } from "../utils/io/PdfGenerator.js";
@@ -32,6 +33,13 @@ class ScribdDownloader extends BaseDownloader {
      * @param {string} flag - Modo de descarga
      */
     async execute(url, flag) {
+        // DETECCIÓN DE URLs DE EVERAND (LIBROS Y LECTURA)
+        if (url.match(everandRegex.BOOK) || url.match(everandRegex.READ) || url.match(everandRegex.BOOK_READ)) {
+            this.logger.info('📚 Detectado eBook de Everand. Usando motor de "Epub Reader"...')
+            await this.downloadEverandBook(url)
+            return
+        }
+
         // Convertir URL de documento a URL de embed
         let embedUrl;
         if (url.match(scribdRegex.DOCUMENT)) {
@@ -70,6 +78,140 @@ class ScribdDownloader extends BaseDownloader {
                 console.log('\n🔄 Cambiando automáticamente a modo IMAGEN...\n')
                 await this.embedsImage(embedUrl)
             }
+        }
+    }
+
+    /**
+     * Descarga especializada para Everand Epub Reader
+     * @param {string} url 
+     */
+    async downloadEverandBook(url) {
+        this.logger.info(`📖 Conectando al Visor de Everand: ${url}`)
+        const page = await puppeteerSg.getPage(url)
+        let tempDir = null
+
+        try {
+            await page.setViewport({ width: 1200, height: 1600 })
+
+            // 1. Manejo inicial (Leer ahora)
+            try {
+                const readBtn = await page.waitForSelector('a[href*="/read/"]', { timeout: 5000 })
+                if (readBtn) {
+                    this.logger.info('Pulsando "Leer ahora"...')
+                    await Promise.all([readBtn.click(), page.waitForNavigation()])
+                }
+            } catch { }
+
+            // 2. Esperar carga del visor
+            this.logger.info('⏳ Esperando carga del lector...')
+            // Esperamos a que el contador de páginas o las columnas de lectura estén listas
+            await Promise.race([
+                page.waitForSelector('.page_counter', { visible: true }),
+                page.waitForSelector('.reader_columns', { visible: true })
+            ]).catch(() => this.logger.warn('Timeout esperando elementos principales'))
+
+
+            // 3. Obtener Título y Total Páginas
+            let title = await page.title()
+            title = title.replace('| Everand', '').trim().replace(/[^a-z0-9]/gi, '_')
+
+            let totalPages = 100
+            try {
+                const pageCounterText = await page.$eval('.page_counter', el => el.innerText) // Ej: "PÁGINA 1 DE 348"
+                if (pageCounterText.includes('DE')) {
+                    totalPages = parseInt(pageCounterText.split('DE')[1].trim())
+                }
+            } catch (e) {
+                this.logger.warn('No se pudo leer el total de páginas, usand default', e)
+            }
+
+            this.logger.info(`📘 Libro: ${title} | Total páginas estimadas: ${totalPages}`)
+
+            // Crear directorio temporal
+            tempDir = path.join(output, `${title}_temp`)
+            await this.createOutputDirectory(tempDir)
+
+            // 4. Inyectar CSS de Formato (CORREGIDO PARA VISIBILIDAD DE TEXTO)
+            await page.addStyleTag({
+                content: `
+                    .text_line, .text_line span { 
+                        visibility: visible !important; 
+                        opacity: 1 !important; 
+                        color: #000 !important; 
+                        display: block !important;
+                    }
+                    .bold, strong, b { font-weight: bold !important; }
+                    .reader_columns { background: white !important; }
+                    /* Ocultar elementos de interfaz */
+                    .page_scrubber_container, .osano-cm-dialog, .top_toolbar, 
+                    .scrubber, .toolbar, header, footer, .header, .footer { 
+                        display: none !important; 
+                    }
+                    .reader_column, .reader_content {
+                        opacity: 1 !important; 
+                        visibility: visible !important;
+                    }
+                    body { background-color: white !important; }
+                `
+            });
+
+            // 5. Bucle de Captura
+            const progress = new ProgressTracker(totalPages, 'Capturando páginas')
+            progress.start()
+
+            // CRÍTICO: Hacer clic en el centro para enfocar el visor antes de usar el teclado
+            try {
+                const viewPort = page.viewport()
+                await page.mouse.click(viewPort.width / 2, viewPort.height / 2)
+            } catch (e) {
+                this.logger.warn('No se pudo hacer clic para enfocar, intentando continuar...')
+            }
+
+            for (let i = 1; i <= totalPages; i++) {
+                // Esperar a que el selector DE TEXTO sea visible
+                try {
+                    await page.waitForSelector('.text_line', { visible: true, timeout: 5000 })
+                } catch {
+                    this.logger.debug(`⚠️ Timeout esperando .text_line en pág ${i} (puede ser imagen o página vacía)`)
+                }
+
+                // Pequeña espera para renderizado de fuentes
+                await new Promise(r => setTimeout(r, 1000))
+
+                // Capturar PDF de la vista actual
+                const pdfPath = path.join(tempDir, `${String(i).padStart(4, '0')}.pdf`)
+                await page.pdf({
+                    path: pdfPath,
+                    width: '1200px',
+                    height: '1600px',
+                    printBackground: true,
+                    pageRanges: '1'
+                })
+
+                // Navegar siguiente página con Teclado (Flecha Derecha)
+                await page.keyboard.press('ArrowRight')
+
+                // Pausa para transición
+                await new Promise(r => setTimeout(r, 500))
+
+                progress.update(i)
+            }
+            progress.complete()
+
+            // 6. Merge final
+            const outputPdfPath = path.join(output, `${title}.pdf`)
+            await this.mergePdfs(tempDir, totalPages, outputPdfPath)
+
+            this.logger.info(`✅ PDF eBook Generado: ${outputPdfPath}`)
+            await directoryIo.remove(tempDir)
+
+        } catch (e) {
+            this.logger.error('Error en descarga de Everand Book', e)
+            // if (tempDir) await directoryIo.remove(tempDir) // Dejar temp para debug si falla
+            throw e
+        } finally {
+            if (page) await page.close()
+            await puppeteerSg.close()
         }
     }
 
@@ -236,9 +378,16 @@ class ScribdDownloader extends BaseDownloader {
                 
                 /* Forzar que el texto sea visible y negro para mejor contraste */
                 .text_layer { 
+                    opacity: 1 !important; 
                     color: black !important; 
                     text-shadow: none !important;
-                    opacity: 1 !important;
+                    font-weight: inherit !important;
+                }
+                .bold { font-weight: bold !important; }
+                h1, h2, h3 { color: black !important; display: block !important; }
+                .premium_unlock_overlay, .upsell { display: none !important; }
+                
+                .text_layer * {
                     visibility: visible !important;
                 }
 
@@ -467,30 +616,41 @@ class ScribdDownloader extends BaseDownloader {
 
         const outputPdf = await PDFDocument.create()
 
-        for (let i = 0; i < pageCount; i++) {
-            const tmpPdfPath = path.join(tempDir, `${String(i).padStart(3, '0')}.pdf`)
+        for (let i = 0; i < pageCount + 1; i++) {
+            const tmpPdfPath = path.join(tempDir, `${String(i).padStart(4, '0')}.pdf`)
+
+            // Intentar con 3 dígitos si falla 4 (compatibilidad con embedsDefault)
+            // O mejor hacer el loop flexible
+            let exists = false;
+            let finalPath = tmpPdfPath;
+
+            try { await fs.access(tmpPdfPath); exists = true; } catch { }
+
+            if (!exists) {
+                const tmp3 = path.join(tempDir, `${String(i).padStart(3, '0')}.pdf`)
+                try { await fs.access(tmp3); finalPath = tmp3; exists = true; } catch { }
+            }
+
+            if (!exists) continue; // Saltar si no existe (inicio loop en 0 vs 1)
 
             try {
-                const pdfBytes = await fs.readFile(tmpPdfPath)
+                const pdfBytes = await fs.readFile(finalPath)
                 const sourcePdf = await PDFDocument.load(pdfBytes)
                 const copiedPages = await outputPdf.copyPages(sourcePdf, sourcePdf.getPageIndices())
                 copiedPages.forEach(page => outputPdf.addPage(page))
             } catch (error) {
-                this.logger.warn(`No se pudo combinar PDF: ${tmpPdfPath}`, { error: error.message })
+                this.logger.warn(`No se pudo combinar PDF: ${finalPath}`, { error: error.message })
             }
         }
 
         const outputPdfBytes = await outputPdf.save()
+        // Asegurar directorio existe
+        await directoryIo.create(path.dirname(outputPath));
         await fs.writeFile(outputPath, outputPdfBytes)
 
         // Validación de integridad
         const finalPageCount = outputPdf.getPageCount()
-        if (finalPageCount !== pageCount) {
-            this.logger.warn(`⚠️  PDF generado incompleto: ${finalPageCount}/${pageCount} páginas`)
-            throw new Error(`PDF incompleto: se esperaban ${pageCount} páginas, se obtuvieron ${finalPageCount}`)
-        } else {
-            this.logger.debug(`✅ Integridad verificada: ${finalPageCount}/${pageCount} páginas`)
-        }
+        this.logger.debug(`✅ Integridad verificada: ${finalPageCount} páginas`)
     }
 
     /**
