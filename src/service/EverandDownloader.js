@@ -11,6 +11,7 @@ import sharp from "sharp"
 import path from "path"
 
 import { scribdDownloader } from "./ScribdDownloader.js"
+import * as scribdFlag from "../const/ScribdFlag.js"
 
 const output = configLoader.load("DIRECTORY", "output")
 
@@ -22,7 +23,7 @@ class EverandDownloader {
         return EverandDownloader.instance
     }
 
-    async execute(url) {
+    async execute(url, flag = scribdFlag.DEFAULT) {
         if (url.match(everandRegex.PODCAST_SERIES)) {
             await this.series(url)
         } else if (url.match(everandRegex.PODCAST_EPISODE)) {
@@ -35,10 +36,67 @@ class EverandDownloader {
             await this.listen(url, true, 'audiobook')
         } else if (url.match(everandRegex.BOOK) || url.match(everandRegex.READ) || url.match(everandRegex.BOOK_READ)) {
             console.log(`📚 Redirigiendo a ScribdDownloader (Nuevo Motor Epub Reader): ${url}`)
-            await scribdDownloader.execute(url)
+            await scribdDownloader.execute(url, flag) // Pasar el flag al ScribdDownloader
         } else {
             throw new Error(`Unsupported URL: ${url}`)
         }
+    }
+
+    /**
+     * Combinar múltiples PDFs en un solo archivo
+     * @param {string} tempDir - Directorio con archivos PDF temporales
+     * @param {number} pageCount - Número total de páginas
+     * @param {string} outputPath - Ruta de salida del PDF combinado
+     */
+    async mergePdfs(tempDir, pageCount, outputPath) {
+        console.log('🔗 Combinando PDFs...')
+        
+        const { PDFDocument } = await import('pdf-lib');
+        const fs = await import('fs/promises');
+        const pathModule = await import('path');
+        const outputPdf = await PDFDocument.create();
+
+        for (let i = 0; i < pageCount + 1; i++) {
+            const tmpPdfPath = pathModule.join(tempDir, `${String(i).padStart(4, '0')}.pdf`);
+
+            // Intentar con 3 dígitos si falla 4 (compatibilidad con embedsDefault)
+            let exists = false;
+            let finalPath = tmpPdfPath;
+
+            try { 
+                await fs.access(tmpPdfPath); 
+                exists = true; 
+            } catch { }
+
+            if (!exists) {
+                const tmp3 = pathModule.join(tempDir, `${String(i).padStart(3, '0')}.pdf`);
+                try { 
+                    await fs.access(tmp3); 
+                    finalPath = tmp3; 
+                    exists = true; 
+                } catch { }
+            }
+
+            if (!exists) continue; // Saltar si no existe (inicio loop en 0 vs 1)
+
+            try {
+                const pdfBytes = await fs.readFile(finalPath);
+                const sourcePdf = await PDFDocument.load(pdfBytes);
+                const copiedPages = await outputPdf.copyPages(sourcePdf, sourcePdf.getPageIndices());
+                copiedPages.forEach(page => outputPdf.addPage(page));
+            } catch (error) {
+                console.warn(`No se pudo combinar PDF: ${finalPath}`, error.message);
+            }
+        }
+
+        const outputPdfBytes = await outputPdf.save();
+        // Asegurar directorio existe
+        await directoryIo.create(pathModule.dirname(outputPath));
+        await fs.writeFile(outputPath, outputPdfBytes);
+
+        // Validación de integridad
+        const finalPageCount = outputPdf.getPageCount();
+        console.log(`✅ Integridad verificada: ${finalPageCount} páginas`);
     }
 
     /**
@@ -175,7 +233,54 @@ class EverandDownloader {
         }
 
         bar.stop();
-        console.log('✅  Descarga finalizada (o detenida).');
+        console.log('✅  Captura de imágenes finalizada.');
+
+        // Convertir imágenes a PDF
+        try {
+            // Generar PDFs individuales desde las imágenes
+            const imageFiles = fs.readdirSync(tempImgDir).filter(f => f.endsWith('.png')).sort();
+            const tempPdfDir = path.join(outputDir, 'temp_pdfs');
+            await directoryIo.create(tempPdfDir);
+
+            for (let i = 0; i < imageFiles.length; i++) {
+                const imagePath = path.join(tempImgDir, imageFiles[i]);
+                const pdfPath = path.join(tempPdfDir, `${String(i + 1).padStart(4, '0')}.pdf`);
+                
+                // Convertir imagen a PDF usando sharp
+                const imageBuffer = await sharp(imagePath)
+                    .toBuffer();
+                
+                // Crear un PDF desde la imagen
+                const { PDFDocument } = await import('pdf-lib');
+                const pdfDoc = await PDFDocument.create();
+                const img = await pdfDoc.embedPng(imageBuffer);
+                
+                const page = pdfDoc.addPage([img.width, img.height]);
+                page.drawImage(img, {
+                    x: 0,
+                    y: 0,
+                    width: img.width,
+                    height: img.height,
+                });
+                
+                const pdfBytes = await pdfDoc.save();
+                await fs.writeFile(pdfPath, pdfBytes);
+            }
+
+            // Combinar todos los PDFs en uno solo
+            const outputPdfPath = path.join(output, `${title}.pdf`);
+            await this.mergePdfs(tempPdfDir, imageFiles.length, outputPdfPath);
+            
+            console.log(`✅ PDF final generado: ${outputPdfPath}`);
+            
+            // Limpiar directorios temporales
+            await directoryIo.remove(tempImgDir);
+            await directoryIo.remove(tempPdfDir);
+        } catch (error) {
+            console.error('❌ Error al generar el PDF final:', error.message);
+            // Aún así cerramos las páginas
+        }
+
         await page.close();
         await puppeteerSg.close();
     }
