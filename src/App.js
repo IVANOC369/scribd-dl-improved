@@ -19,7 +19,7 @@ class App {
         } else if (url.match(slideshareRegex.DOMAIN)) {
             await slideshareDownloader.execute(url)
         } else if (url.match(everandRegex.DOMAIN)) {
-            await everandDownloader.execute(url)
+            await everandDownloader.execute(url, flag)
         } else {
             throw new Error(`Unsupported URL: ${url}`)
         }
